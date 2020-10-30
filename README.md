@@ -14,3 +14,13 @@ The package offers the two functions `ventil.Parse` and `ventil.ParseFile`. `ven
 `*ventil.KV` represents a Key-Value pair. It may contain a value or children, depending on the type of the KV. You can check it with the `HasValue` flag. Be aware that `kv.HasValue == false` does not guarantee, that `kv.FirstChild != nil`, in that case the list of children was empty.
 
 You can call `kv.WriteTo(w)` to write an equivalent representation to the original file but without the comments to w.
+
+## features
+* Quoted and unquoted keys and values
+* Comments
+* Escape codes in strings
+* Newlines in keys and values
+* Subkeys
+
+## planned features
+* Includes
