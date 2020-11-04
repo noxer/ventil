@@ -1,11 +1,11 @@
 package ventil
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -39,14 +39,40 @@ var tokenTypeNames = map[int]string{
 
 var errClosingParens = errors.New("ventil: unexpected closing parenthesis")
 
+// ParsingError indicates an error while parsing a KV file.
+type ParsingError struct {
+	File      string
+	Byte      int64
+	Line      int64
+	PosInLine int64
+
+	wrapped error
+}
+
+func newParsingError(err error, token token) ParsingError {
+	return ParsingError{
+		File:      token.file,
+		Byte:      token.pos,
+		Line:      token.line,
+		PosInLine: token.posInLine,
+		wrapped:   err,
+	}
+}
+
+func (e ParsingError) Error() string {
+	return fmt.Sprintf("ventil: parsing error in file %s:%d: %s", e.File, e.Line, e.wrapped)
+}
+
+func (e ParsingError) Unwrap() error {
+	return e.wrapped
+}
+
+// Includer creates an including function to open included files. (Sorry)
+type Includer func(name string) (io.ReadCloser, Includer, error)
+
 // Parse reads from a reader and decodes the KV data.
-func Parse(r io.Reader) (*KV, error) {
-	br := bufio.NewReader(r)
-
-	tokens := make(chan token, 32)
-	go tokenize(br, tokens)
-
-	return parse(tokens)
+func Parse(r io.Reader, includer Includer) (*KV, error) {
+	return parseFile(r, includer, "<no file>")
 }
 
 // ParseFile reads from a file and decodes the KV data.
@@ -57,10 +83,19 @@ func ParseFile(name string) (*KV, error) {
 	}
 	defer f.Close()
 
-	return Parse(f)
+	return parseFile(f, FileIncluder(name), name)
 }
 
-func parse(tokens chan token) (*KV, error) {
+func parseFile(r io.Reader, includer Includer, filename string) (*KV, error) {
+	br := newByteReader(r)
+
+	tokens := make(chan token, 32)
+	go tokenize(br, filename, tokens)
+
+	return parse(tokens, includer)
+}
+
+func parse(tokens chan token, includer Includer) (*KV, error) {
 	var (
 		startKV   = &KV{}
 		prevKV    *KV
@@ -72,14 +107,25 @@ func parse(tokens chan token) (*KV, error) {
 		if token.typ == tokenTypeComment {
 			continue
 		}
+		if token.typ == tokenTypeError {
+			// Todo output file and line
+			return nil, newParsingError(token.err, token)
+		}
 
 		if expectKey { // read the KV key
 			if token.typ == tokenTypeClosingParens {
-				break
+				if startKV == currentKV {
+					startKV = nil
+				}
+
+				return startKV, newParsingError(errClosingParens, token)
 			}
 
 			if token.typ != tokenTypeString {
-				return startKV, fmt.Errorf("ventil: Unexpected token type %s, expected String", tokenTypeNames[token.typ])
+				return startKV, newParsingError(
+					fmt.Errorf("ventil: Unexpected token type %s, expected String", tokenTypeNames[token.typ]),
+					token,
+				)
 			}
 
 			currentKV.Key = token.data
@@ -89,16 +135,34 @@ func parse(tokens chan token) (*KV, error) {
 
 		switch token.typ {
 		case tokenTypeString:
-			currentKV.HasValue = true
-			currentKV.Value = token.data
+			if includer != nil && (currentKV.Key == "#base" || currentKV.Key == "#include") {
+				f, i, err := includer(token.data)
+				if err == nil {
+					innerKV, _ := parseFile(f, i, token.data)
+					f.Close()
+
+					if innerKV != nil {
+						*currentKV = *innerKV
+						for currentKV.NextSibling != nil {
+							currentKV = currentKV.NextSibling
+						}
+					}
+				} else {
+					currentKV.HasValue = true
+					currentKV.Value = token.data
+				}
+			} else {
+				currentKV.HasValue = true
+				currentKV.Value = token.data
+			}
 		case tokenTypeOpeningParens:
-			child, err := parse(tokens)
+			child, err := parse(tokens, includer)
 			currentKV.FirstChild = child
-			if err != nil && err != errClosingParens {
+			if err != nil && errors.Unwrap(err) != errClosingParens {
 				return startKV, err
 			}
 		case tokenTypeClosingParens:
-			return startKV, errClosingParens
+			return startKV, newParsingError(errClosingParens, token)
 		}
 
 		nextKV := &KV{}
@@ -131,7 +195,7 @@ func (t token) String() string {
 	return fmt.Sprintf("Token: %s \"%s\" Error: %s", typeNames[t.typ], t.data, t.err)
 }
 
-func tokenize(r *bufio.Reader, tokens chan token) {
+func tokenize(r *reader, filename string, tokens chan token) {
 	defer close(tokens)
 
 	for {
@@ -139,18 +203,31 @@ func tokenize(r *bufio.Reader, tokens chan token) {
 		if err != nil {
 			if err != io.EOF {
 				tokens <- token{
+					file:      filename,
+					pos:       r.readBytes,
+					line:      r.readLines,
+					posInLine: r.readBytesInLine,
+
 					typ: tokenTypeError,
 					err: err,
 				}
 			}
 			return
 		}
+		currentPos := r.readBytes - 1
+		currentLine := r.readLines
+		currentPosInLine := r.readBytesInLine
 
 		switch b {
 
 		case '"': // quoted string
 			str, err := readQuotedString(r)
 			tokens <- token{
+				file:      filename,
+				pos:       currentPos,
+				line:      currentLine,
+				posInLine: currentPosInLine,
+
 				typ:  tokenTypeString,
 				data: str,
 				err:  err,
@@ -160,13 +237,32 @@ func tokenize(r *bufio.Reader, tokens chan token) {
 			}
 
 		case '{': // opening parenthesis
-			tokens <- token{typ: tokenTypeOpeningParens}
+			tokens <- token{
+				file:      filename,
+				pos:       currentPos,
+				line:      currentLine,
+				posInLine: currentPosInLine,
+
+				typ: tokenTypeOpeningParens,
+			}
 		case '}': // closing parenthesis
-			tokens <- token{typ: tokenTypeClosingParens}
+			tokens <- token{
+				file:      filename,
+				pos:       currentPos,
+				line:      currentLine,
+				posInLine: currentPosInLine,
+
+				typ: tokenTypeClosingParens,
+			}
 
 		case '/': // comment
-			line, _, err := r.ReadLine()
+			line, err := r.ReadLine()
 			tokens <- token{
+				file:      filename,
+				pos:       currentPos,
+				line:      currentLine,
+				posInLine: currentPosInLine,
+
 				typ:  tokenTypeComment,
 				data: string(line),
 				err:  err,
@@ -179,6 +275,11 @@ func tokenize(r *bufio.Reader, tokens chan token) {
 			r.UnreadByte()
 			str, err := readUnquotedString(r)
 			tokens <- token{
+				file:      filename,
+				pos:       currentPos,
+				line:      currentLine,
+				posInLine: currentPosInLine,
+
 				typ:  tokenTypeString,
 				data: str,
 				err:  err,
@@ -190,7 +291,7 @@ func tokenize(r *bufio.Reader, tokens chan token) {
 	}
 }
 
-func readUnquotedString(r *bufio.Reader) (string, error) {
+func readUnquotedString(r *reader) (string, error) {
 	var buf strings.Builder
 	escaped := false
 
@@ -232,7 +333,7 @@ func readUnquotedString(r *bufio.Reader) (string, error) {
 
 }
 
-func readQuotedString(r *bufio.Reader) (string, error) {
+func readQuotedString(r *reader) (string, error) {
 	var buf strings.Builder
 	escaped := false
 
@@ -272,7 +373,7 @@ func readQuotedString(r *bufio.Reader) (string, error) {
 	}
 }
 
-func consumeWhitespace(r *bufio.Reader) (byte, error) {
+func consumeWhitespace(r *reader) (byte, error) {
 	for {
 		b, err := r.ReadByte()
 		if err != nil {
@@ -287,4 +388,28 @@ func consumeWhitespace(r *bufio.Reader) (byte, error) {
 
 func isWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// FileIncluder allows the parser to open included files.
+func FileIncluder(path string, excludedFiles ...string) func(string) (io.ReadCloser, Includer, error) {
+	absPath, _ := filepath.Abs(path)
+	basePath := filepath.Dir(absPath)
+	excludedFiles = append(excludedFiles, absPath)
+
+	return func(name string) (io.ReadCloser, Includer, error) {
+		newPath := filepath.Join(basePath, name)
+
+		for _, excluded := range excludedFiles {
+			if newPath == excluded {
+				return nil, nil, fmt.Errorf("valve: include loop detected: %s", newPath)
+			}
+		}
+
+		f, err := os.Open(newPath)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return f, FileIncluder(newPath, excludedFiles...), nil
+	}
 }
