@@ -76,14 +76,19 @@ func Parse(r io.Reader, includer Includer) (*KV, error) {
 }
 
 // ParseFile reads from a file and decodes the KV data.
-func ParseFile(name string) (*KV, error) {
+func ParseFile(name string, allowIncludes bool) (*KV, error) {
 	f, err := os.Open(name)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	return parseFile(f, FileIncluder(name), name)
+	var includer Includer
+	if allowIncludes {
+		includer = FileIncluder(name)
+	}
+
+	return parseFile(f, includer, name)
 }
 
 func parseFile(r io.Reader, includer Includer, filename string) (*KV, error) {
