@@ -77,7 +77,8 @@ func Parse(r io.Reader, includer Includer) (*KV, error) {
 
 // ParseFile reads from a file and decodes the KV data.
 func ParseFile(name string, allowIncludes bool) (*KV, error) {
-	f, err := os.Open(name)
+	// gosec false positive. purpose of the lib is to be able to open files
+	f, err := os.Open(name) // #nosec G304
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +411,8 @@ func FileIncluder(path string, excludedFiles ...string) func(string) (io.ReadClo
 			}
 		}
 
-		f, err := os.Open(newPath)
+		// gosec "false positive" (allowing imports in inherently unsafe, that's why it's disabled by default)
+		f, err := os.Open(newPath) // #nosec G304
 		if err != nil {
 			return nil, nil, err
 		}
