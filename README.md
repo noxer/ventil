@@ -1,3 +1,5 @@
+Moved to https://codeberg.org/plusmid/ventil
+
 # ventil
 Valve Key-Value file parser in Go
 
@@ -25,3 +27,4 @@ You can call `kv.WriteTo(w)` to write an equivalent representation to the origin
 * Newlines in keys and values
 * Subkeys
 * Includes
+
